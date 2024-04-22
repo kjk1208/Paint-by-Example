@@ -24,7 +24,6 @@ from pytorch_lightning.plugins.environments import ClusterEnvironment,SLURMEnvir
 
 from importlib import import_module
 
-
 def get_parser(**parser_kwargs):
     def str2bool(v):
         if isinstance(v, bool):
@@ -62,7 +61,7 @@ def get_parser(**parser_kwargs):
         metavar="base_config.yaml",
         help="paths to base configs. Loaded from left-to-right. "
              "Parameters can be overwritten or added with command-line options of the form `--key value`.",
-        default=["configs/stable-diffusion/v1-inference-inpaint.yaml"],
+        default=["configs/warping.yaml"],
     )
     parser.add_argument(
         "-t",
@@ -113,13 +112,13 @@ def get_parser(**parser_kwargs):
         "-l",
         "--logdir",
         type=str,
-        default="logs",
+        default="models/Paint-by-Example",
         help="directory for logging dat shit",
     )
     parser.add_argument(
         "--pretrained_model",
         type=str,
-        default="",
+        default="pretrained_models/model-13channel.ckpt",
         help="path to pretrained model",
     )
     parser.add_argument(
@@ -127,7 +126,7 @@ def get_parser(**parser_kwargs):
         type=str2bool,
         nargs="?",
         const=True,
-        default=True,
+        default=False,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
     )
     parser.add_argument(
@@ -138,8 +137,6 @@ def get_parser(**parser_kwargs):
         default=False,
         help="Train from scratch",
     )
-    
-    
     return parser
 
 
@@ -163,20 +160,20 @@ class WrappedDataset(Dataset):
         return self.data[idx]
 
 
-def worker_init_fn(_):
-    worker_info = torch.utils.data.get_worker_info()
+# def worker_init_fn(_):
+#     worker_info = torch.utils.data.get_worker_info()
 
-    dataset = worker_info.dataset
-    worker_id = worker_info.id
+#     dataset = worker_info.dataset
+#     worker_id = worker_info.id
 
-    if isinstance(dataset, Txt2ImgIterableBaseDataset):
-        split_size = dataset.num_records // worker_info.num_workers
-        # reset num_records to the true number to retain reliable length information
-        dataset.sample_ids = dataset.valid_ids[worker_id * split_size:(worker_id + 1) * split_size]
-        current_id = np.random.choice(len(np.random.get_state()[1]), 1)
-        return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
-    else:
-        return np.random.seed(np.random.get_state()[1][0] + worker_id)
+#     if isinstance(dataset, Txt2ImgIterableBaseDataset):
+#         split_size = dataset.num_records // worker_info.num_workers
+#         # reset num_records to the true number to retain reliable length information
+#         dataset.sample_ids = dataset.valid_ids[worker_id * split_size:(worker_id + 1) * split_size]
+#         current_id = np.random.choice(len(np.random.get_state()[1]), 1)
+#         return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
+#     else:
+#         return np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
 class DataModuleFromConfig(pl.LightningDataModule):
@@ -187,74 +184,54 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.batch_size = batch_size
         self.dataset_configs = dict()
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
-        self.use_worker_init_fn = use_worker_init_fn
+        self.config = config
+        
+        #self.use_worker_init_fn = use_worker_init_fn
         if train is not None:
             self.dataset_configs["train"] = train
             self.train_dataloader = self._train_dataloader
         if validation is not None:
             self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
-        if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
-        if predict is not None:
-            self.dataset_configs["predict"] = predict
-            self.predict_dataloader = self._predict_dataloader
-        self.wrap = wrap
+            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)        
 
     def prepare_data(self):
         for data_cfg in self.dataset_configs.values():
             instantiate_from_config(data_cfg)
 
     def setup(self, stage=None):
-        self.datasets = dict(
-            (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs)
-        if self.wrap:
-            for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
+        # if stage == 'fit' or stage is None:
+        #     dataset_module = import_module("dataset")
+        #     # train과 validation에 대한 설정을 self.config에서 직접 참조
+        #     self.train_dataset = getattr(dataset_module, self.dataset_configs['train']['target'])(
+        #         **self.dataset_configs['train']['params']
+        #     )
+        #     self.valid_dataset = getattr(dataset_module, self.dataset_configs['validation']['target'])(
+        #         **self.dataset_configs['validation']['params']
+        #     )
+        if stage == 'fit' or stage is None:
+            dataset_module = import_module("dataset")
+            self.train_dataset = getattr(dataset_module, self.config.dataset_name)(
+                data_root_dir=self.config.data_root_dir, 
+                img_H=self.config.img_H, 
+                img_W=self.config.img_W, 
+                transform_size=self.config.transform_size, 
+                transform_color=self.config.transform_color,
+            )
+            self.valid_dataset = getattr(dataset_module, self.config.dataset_name)(
+                data_root_dir=self.config.data_root_dir, 
+                img_H=self.config.img_H, 
+                img_W=self.config.img_W, 
+                #is_test=True, 
+                is_paired=True, 
+                is_sorted=True, 
+            )
 
     def _train_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn)
+        return DataLoader(self.train_dataset, batch_size=self.config.batch_size, shuffle=True, num_workers=10)
 
-    def _val_dataloader(self, shuffle=False):
-        if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,
-                          worker_init_fn=init_fn,
-                          shuffle=shuffle)
+    def _val_dataloader(self):
+        return DataLoader(self.valid_dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=10)
 
-    def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-
-        # do not shuffle dataloader for iterable dataset
-        shuffle = shuffle and (not is_iterable_dataset)
-
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle)
-
-    def _predict_dataloader(self, shuffle=False):
-        if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn)
 
 
 class SetupCallback(Callback):
@@ -558,6 +535,9 @@ if __name__ == "__main__":
             "filename": "{epoch:06}",
             "verbose": True,
             "save_last": True,
+            'save_top_k': -1,
+            'every_n_epochs' : 20, 
+            'save_weights_only': False
         }
     }
     if hasattr(model, "monitor"):
@@ -626,8 +606,9 @@ if __name__ == "__main__":
                         "filename": "{epoch:06}-{step:09}",
                         "verbose": True,
                         'save_top_k': -1,
-                        'every_n_train_steps': 10000,
-                        'save_weights_only': True
+                        'every_n_epochs' : 50, 
+                        #'every_n_train_steps': 10000,
+                        'save_weights_only': False
                     }
                     }
         }
