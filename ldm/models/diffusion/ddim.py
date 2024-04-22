@@ -170,7 +170,7 @@ class DDIMSampler(object):
         if 'test_model_kwargs' in kwargs:
             kwargs=kwargs['test_model_kwargs']
             x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
-        elif 'rest' in kwargs:
+        elif 'rest' in kwargs:            
             x = torch.cat((x, kwargs['rest']), dim=1)
         else:
             raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")

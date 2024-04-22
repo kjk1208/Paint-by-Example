@@ -178,5 +178,5 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
 
 if __name__ == "__main__":
     from ldm.util import count_params
-    model = FrozenCLIPEmbedder()
+    model = FrozenCLIPImageEmbedder()
     count_params(model, verbose=True)

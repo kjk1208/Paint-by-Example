@@ -24,6 +24,8 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 from torchvision.transforms import Resize
+from torchvision.transforms.functional import resize
+import torchvision
 import math
 import time
 import random
@@ -87,6 +89,8 @@ class DDPM(pl.LightningModule):
         self.log_every_t = log_every_t
         self.first_stage_key = first_stage_key
         self.image_size = image_size 
+        self.image_size_H = 64
+        self.image_size_W = 48
         self.channels = channels
         self.u_cond_percent=u_cond_percent
         self.use_positional_encodings = use_positional_encodings
@@ -339,6 +343,7 @@ class DDPM(pl.LightningModule):
             mask = batch['inpaint_mask']
             inpaint = batch['inpaint_image']
             reference = batch['ref_imgs']
+            image_densepose = batch['image_densepose']
         else:
             x = batch[k]
         if len(x.shape) == 3:
@@ -348,7 +353,8 @@ class DDPM(pl.LightningModule):
         mask = mask.to(memory_format=torch.contiguous_format).float()
         inpaint = inpaint.to(memory_format=torch.contiguous_format).float()
         reference = reference.to(memory_format=torch.contiguous_format).float()
-        return x,inpaint,mask,reference
+        image_densepose = image_densepose.to(memory_format=torch.contiguous_format).float()
+        return x,inpaint,mask,reference, image_densepose
 
     def shared_step(self, batch):
         x = self.get_input(batch, self.first_stage_key)
@@ -480,6 +486,8 @@ class LatentDiffusion(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
+        self.imagenet_norm = torchvision.transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
+                                         (0.26862954, 0.26130258, 0.27577711))
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -674,19 +682,25 @@ class LatentDiffusion(DDPM):
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None,get_mask=False,get_reference=False):
         
-        x,inpaint,mask,reference = super().get_input(batch, k)
+        x,inpaint,mask,reference,image_densepose = super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
             inpaint = inpaint[:bs]
             mask = mask[:bs]
             reference = reference[:bs]
+            image_densepose = image_densepose[:bs]
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
         encoder_posterior_inpaint = self.encode_first_stage(inpaint)
         z_inpaint = self.get_first_stage_encoding(encoder_posterior_inpaint).detach()
-        mask_resize = Resize([z.shape[-1],z.shape[-1]])(mask)
-        z_new = torch.cat((z,z_inpaint,mask_resize),dim=1)
+        #mask_resize = Resize([z.shape[-2],z.shape[-1]])(mask)
+        mask_resize = resize(mask, (z.shape[-2], z.shape[-1]))
+        mask_resize = mask_resize.to(memory_format=torch.contiguous_format).float()
+        
+        encoder_posterior_densepose = self.encode_first_stage(image_densepose)
+        z_dense = self.get_first_stage_encoding(encoder_posterior_densepose).detach()
+        z_new = torch.cat((z,z_inpaint,z_dense,mask_resize),dim=1)
 
         if self.model.conditioning_key is not None:
             if cond_key is None:
@@ -695,7 +709,9 @@ class LatentDiffusion(DDPM):
                 if cond_key in ['txt','caption', 'coordinates_bbox']:
                     xc = batch[cond_key]
                 elif cond_key == 'image':
-                    xc = reference
+                    xc = resize(reference, (224,224))
+                    xc = self.imagenet_norm((xc+1)/2)  
+                    #xc = reference
                 elif cond_key == 'class_label':
                     xc = batch
                 else:
@@ -1270,7 +1286,8 @@ class LatentDiffusion(DDPM):
                verbose=True, timesteps=None, quantize_denoised=False,
                mask=None, x0=None, shape=None,**kwargs):
         if shape is None:
-            shape = (batch_size, self.channels, self.image_size, self.image_size)
+            #shape = (batch_size, self.channels, self.image_size, self.image_size)
+            shape = (batch_size, self.channels, self.image_size_H, self.image_size_W)
         if cond is not None:
             if isinstance(cond, dict):
                 cond = {key: cond[key][:batch_size] if not isinstance(cond[key], list) else
@@ -1285,10 +1302,13 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def sample_log(self,cond,batch_size,ddim, ddim_steps,**kwargs):
+        
+        
 
         if ddim:
             ddim_sampler = DDIMSampler(self)
-            shape = (self.channels, self.image_size, self.image_size)
+            #shape = (self.channels, self.image_size, self.image_size)
+            shape = (self.channels, self.image_size_H, self.image_size_W)
             samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
                                                         shape,cond,verbose=False,**kwargs)
 
